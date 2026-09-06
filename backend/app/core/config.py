@@ -8,7 +8,7 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://rehab:rehab@localhost:5432/rehabbuddy"
     test_database_url: str = "postgresql+psycopg://rehab:rehab@localhost:5432/rehabbuddy_test"
-    jwt_secret: str = "dev-secret-change-me"
+    jwt_secret: str = "dev-only-insecure-secret-change-me-in-production"
     jwt_expire_minutes: int = 60 * 24
     cors_origins: list[str] = ["http://localhost:5173"]
     anthropic_api_key: str | None = None
