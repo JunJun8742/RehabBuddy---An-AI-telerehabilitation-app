@@ -1,0 +1,24 @@
+{
+  "id": "squat",
+  "name": "Bodyweight squat",
+  "description": "Stand side-on to the camera with feet shoulder width apart. Lower your hips as if sitting into a chair, then stand back up.",
+  "camera_view": "side",
+  "side": "both",
+  "required_landmarks": ["shoulder", "hip", "knee", "ankle"],
+  "angles": {
+    "knee": { "points": ["hip", "knee", "ankle"] },
+    "torso_lean": { "points": ["shoulder", "hip"], "reference": "vertical" }
+  },
+  "primary_angle": "knee",
+  "detection": {
+    "down_threshold": 100,
+    "up_threshold": 160,
+    "min_hold_frames": 3
+  },
+  "smoothing": { "type": "ema", "alpha": 0.3 },
+  "form_rules": [
+    { "id": "torso_lean", "angle": "torso_lean", "max": 30, "frames": 5, "cue": "Keep your chest up" },
+    { "id": "shallow_depth", "angle": "knee", "rep_min_must_be_below": 110, "frames": 1, "cue": "Go a little deeper" }
+  ],
+  "illustration": "squat.svg"
+}
