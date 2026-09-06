@@ -9,6 +9,8 @@ RehabBuddy is a telerehabilitation web app. Patients perform prescribed exercise
 
 This is a portfolio and learning project. It is not intended for real clinical use, so HIPAA-grade controls are out of scope. The design still avoids storing video and keeps the record of truth on the server, which is good engineering regardless.
 
+Positioning: RehabBuddy is presented everywhere (README, UI footer, deployment landing page) as an educational telerehabilitation prototype. It is never described as a clinical or hospital telemedicine system. It has no audit log, consent management, clinical validation, or production privacy controls.
+
 ### In scope for v1
 
 - Email and password auth with two roles: `doctor` and `patient`.
@@ -37,9 +39,9 @@ Pose estimation runs entirely in the browser. Only landmark data, never video, l
 ```
 Patient browser                          FastAPI backend                 Claude API
 +------------------------+   landmarks   +---------------------------+
-| MediaPipe Pose (WebGL) | ------------> | Analyzer (NumPy/pandas)   |
+| MediaPipe Pose (WebGL) | ------------> | Quality gate + analyzer   |
 | angle math             |   (JSON,      | -> session_analysis       |
-| rep state machine      |    ~100KB     | Summary service           | --------> claude-opus-5
+| rep state machine      |    ~200KB     | Summary service           | --------> claude-opus-5
 | form rules             |    gzipped)   | -> ai_summaries           | <-------- structured JSON
 | session buffer         |               | REST API + auth           |
 +------------------------+               +---------------------------+
@@ -113,15 +115,15 @@ The `shared/exercises` folder is read by both the frontend (bundled at build tim
 ### Patient features
 
 - Home: today's assigned exercises with target sets and reps, completion state, and a streak counter.
-- Exercise session: camera preview with skeleton overlay, a "get in frame" calibration step, live rep counter, form cue banner, set and rest timers, and an end-of-session recap (reps, best range of motion, form score).
+- Exercise session: camera preview with skeleton overlay, a "get in frame" calibration step, live rep counter, form cue banner, set and rest timers, and an end-of-session recap (reps, best range of motion, form consistency).
 - History: list of past sessions with per-exercise trend charts.
 
 ### Doctor features
 
 - Patient list with a status chip per patient: `on_track`, `missed_sessions`, or `flagged`.
-- Patient detail: range of motion and form score charts over time per exercise, an adherence calendar, and a session list.
-- Session review: per-rep breakdown table, AI summary, concerns, and suggested next steps.
-- Plan editor: assign exercises from the library with sets, reps, and days per week. AI suggestions can be applied to the plan in one click, then edited. Nothing changes without the doctor saving.
+- Patient detail: range of motion and form consistency charts over time per exercise, an adherence calendar, and a session list.
+- Session review: per-rep breakdown table, AI summary, concerns, and suggested next steps. Suggestions render in a visually distinct panel headed "AI suggestion, doctor review required", separate from the plan and from clinical notes, and each shows the current value next to the proposed value (for example "Reps 8 -> 10").
+- Plan editor: assign exercises from the library with sets, reps, and days per week. "Apply suggestion" prefills the plan editor with the proposed change; it never writes to the plan directly. Nothing changes without the doctor saving.
 - Clinical notes: free-text notes per patient, stored separately from AI output.
 
 ### AI features
@@ -144,6 +146,8 @@ The `shared/exercises` folder is read by both the frontend (bundled at build tim
 
 Threshold numbers above are starting points and are tuned during implementation against the recorded fixtures. The definition file, not this spec, is authoritative once tuned.
 
+These are detection thresholds for the rep state machine, not clinical targets. Nothing in the app labels an angle as clinically correct or incorrect. The doctor UI reports measured range of motion in degrees and leaves the clinical judgment to the doctor. Per-patient clinical targets are out of scope for v1.
+
 ### Exercise definition schema
 
 Each file in `shared/exercises/<id>.json` contains:
@@ -161,11 +165,12 @@ Each file in `shared/exercises/<id>.json` contains:
     "torso_lean": { "points": ["shoulder", "hip"], "reference": "vertical" }
   },
   "primary_angle": "knee",
-  "rep": {
+  "detection": {
     "down_threshold": 100,
     "up_threshold": 160,
     "min_hold_frames": 3
   },
+  "smoothing": { "type": "ema", "alpha": 0.3 },
   "form_rules": [
     { "id": "torso_lean", "angle": "torso_lean", "max": 30, "frames": 5, "cue": "Keep your chest up" },
     { "id": "shallow_depth", "angle": "knee", "rep_min_must_be_below": 110, "cue": "Go a little deeper" }
@@ -174,13 +179,22 @@ Each file in `shared/exercises/<id>.json` contains:
 }
 ```
 
-Landmark names map to MediaPipe indices through a shared lookup. `side: "both"` means the analyzer evaluates left and right independently and reports a symmetry ratio.
+Landmark names map to MediaPipe indices through a shared lookup. `side: "both"` means the analyzer evaluates left and right independently and reports a symmetry ratio. The `smoothing` block fixes the filter type and constants so both implementations use identical parameters.
+
+### Determinism and parity
+
+The TypeScript live analyzer and the Python server analyzer implement the same algorithm in two languages. To keep them honest:
+
+- The pipeline from landmarks to rep events is deterministic. No randomness, no wall-clock dependence, fixed smoothing constants from the definition file, and identical initial filter state (first sample).
+- Both implementations must produce the same rep count and the same rep frame boundaries (within one frame) on every fixture in `shared/fixtures/`. A parity test in each suite asserts this against expected values stored alongside each fixture.
+- The server stores the client's rep count and rep boundaries next to its own. A `rep_count_mismatch` boolean on the analysis row makes disagreements visible in the doctor UI and in logs, so drift between implementations shows up in real use, not only in tests.
+- The fixture expected values are generated once by the Python analyzer, reviewed by hand against the recorded movement, and then frozen. Changing them requires an `analyzer_version` bump.
 
 ### Live pipeline in the browser, per frame
 
 1. Pose Landmarker returns 33 landmarks with x, y, z, and visibility.
 2. Visibility gate: every landmark in `required_landmarks` must have visibility above 0.6. If not, counting pauses and the UI shows "step back into frame". Reps are never counted while paused.
-3. Compute each angle in the definition using a small vector-math helper. Smooth each angle with a one-euro filter or exponential moving average to remove jitter.
+3. Compute each angle in the definition using a small vector-math helper. Smooth each angle with the filter and constants given in the definition file `smoothing` block, so the live and server results match.
 4. Feed the smoothed primary angle into the rep state machine (`up` to `down` when below `down_threshold` for `min_hold_frames`, `down` to `up` when above `up_threshold`). Each completed rep emits an event with its min and max angle and frame range.
 5. Evaluate form rules on each frame during the active phase of a rep. A rule violated for more than its `frames` threshold shows the cue and is recorded against that rep.
 6. Push `{t, landmarks, angles}` into the session buffer.
@@ -199,27 +213,37 @@ Landmark names map to MediaPipe indices through a shared lookup. `side: "both"` 
   "ended_at": "...",
   "client_rep_count": 12,
   "client_reps": [{ "start_frame": 10, "end_frame": 55, "min_angle": 92.1, "max_angle": 171.0 }],
-  "fps": 15,
+  "fps": 30,
   "landmarks": [[[x, y, z, v], ...33], ...frames]
 }
 ```
 
-Landmarks are downsampled to 15 fps and rounded to three decimals before upload. The frontend holds the payload in IndexedDB until the upload succeeds.
+Landmarks are uploaded at the native capture rate, capped at 30 fps, and rounded to three decimals. No downsampling, so peak angles on faster movements are not lost. A five-minute session is roughly 1 MB raw and about 200 KB gzipped. The frontend holds the payload in IndexedDB until the upload succeeds.
 
 ### Python analyzer
 
 Runs synchronously on upload. Steps:
 
 1. Validate payload shape (33 landmarks per frame, at least 15 frames).
-2. Recompute all angles from raw landmarks. Apply the same smoothing as the frontend.
-3. Run the rep state machine. This count is the record. The client count is stored for comparison only.
-4. Per rep: peak range of motion, duration, concentric and eccentric time, smoothness (spectral arc length of the angle velocity), form rule violations.
-5. Per session: rep count, mean and best range of motion, form score (0 to 100, equal to 100 times the fraction of reps with no form rule violations), symmetry ratio for `side: "both"` exercises, fatigue slope (linear fit of peak ROM across reps).
-6. Per patient, comparing to history: delta versus the previous session and versus the first-session baseline for the same exercise.
-7. Flags, all deterministic:
+2. Data quality gate. Compute and store on the analysis row:
+   - `valid_frame_ratio`: fraction of frames where all `required_landmarks` have visibility above 0.6.
+   - `mean_visibility`: mean visibility of `required_landmarks` over all frames.
+   - `fps`: as reported by the client.
+   - `paused_seconds`: total duration of the longest runs of invalid frames (the time the live UI would have been paused).
+   - `low_quality`: true when `valid_frame_ratio` is below 0.7 or `fps` is below 10.
+   Low-quality sessions are still analyzed and shown, but they are marked in the UI, excluded from the patient's baseline and trend calculations, and passed to the LLM with the quality warning. Invalid frames are excluded from angle computation, and reps spanning an invalid gap longer than one second are discarded.
+3. Recompute all angles from valid frames. Apply the smoothing from the definition file.
+4. Run the rep state machine. This count is the record. The client count and rep boundaries are stored for comparison and `rep_count_mismatch` is set when they differ.
+5. Per rep: peak range of motion, duration, concentric and eccentric time, smoothness (spectral arc length of the angle velocity), form rule violations.
+6. Per session: rep count, mean and best range of motion, form consistency (0 to 100, equal to 100 times the fraction of reps with no form rule violations; labeled in the UI as "form consistency", a percentage of clean reps, never as a quality score), symmetry ratio for `side: "both"` exercises, ROM trend slope.
+   - `symmetry`: `min(left_mean_rom, right_mean_rom) / max(left_mean_rom, right_mean_rom)`, a value from 0 to 1 where 1 is perfectly symmetric. Null for single-side exercises.
+   - `rom_trend_slope`: slope of a linear fit of peak ROM against rep index, in degrees per rep. This is a descriptive movement trend indicator shown on the session page. It is not a flag and the prompt does not call it fatigue.
+7. Per patient, comparing to history: delta versus the previous session and versus the first-session baseline for the same exercise. Low-quality sessions are excluded from both.
+8. Flags, all deterministic:
    - `rom_drop`: mean ROM at least 15% below baseline.
-   - `form_low`: form score below 60.
-   - `asymmetry`: symmetry ratio outside 0.8 to 1.2.
+   - `form_low`: form consistency below 60.
+   - `asymmetry`: symmetry below 0.8.
+   - `low_quality`: the quality gate tripped.
    - `missed_sessions`: three or more prescribed days missed in the last seven (computed by a separate adherence job when the patient list loads).
    - `rep_shortfall`: reps below 70% of prescribed.
 
@@ -234,9 +258,9 @@ PostgreSQL. Ids are UUIDs.
 - `exercises`: id (slug, matches the JSON file), name, description, camera_view, illustration_url. Catalog only. Rules live in the JSON.
 - `plans`: id, patient_id, doctor_id, created_at, active. One active plan per patient, enforced by a partial unique index.
 - `plan_items`: id, plan_id, exercise_id, sets, reps, days_per_week, notes.
-- `sessions`: id, patient_id, exercise_id, plan_item_id (nullable), started_at, ended_at, client_rep_count, status (`uploaded`, `analyzed`, `failed`), failure_reason (nullable), created_at.
+- `sessions`: id, patient_id, exercise_id, plan_item_id (nullable), started_at, ended_at, client_rep_count, client_reps (JSONB), status (`uploaded`, `analyzed`, `failed`), failure_reason (nullable), created_at.
 - `session_landmarks`: session_id (primary key), fps, data (JSONB). Separate table so list queries never load it.
-- `session_analysis`: session_id (primary key), analyzer_version, rep_count, mean_rom, best_rom, form_score, symmetry (nullable), fatigue_slope, per_rep (JSONB), violations (JSONB), flags (JSONB array of codes), computed_at.
+- `session_analysis`: session_id (primary key), analyzer_version, rep_count, rep_count_mismatch, mean_rom, best_rom, form_consistency, symmetry (nullable), rom_trend_slope, valid_frame_ratio, mean_visibility, fps, paused_seconds, low_quality, per_rep (JSONB), violations (JSONB), flags (JSONB array of codes), computed_at.
 - `ai_summaries`: id, session_id (nullable), patient_id, kind (`session`, `progress`), status (`pending`, `ready`, `failed`), content (JSONB, the validated structured output), model, prompt_version, error (nullable), created_at.
 - `clinical_notes`: id, patient_id, doctor_id, body, created_at.
 
@@ -254,8 +278,8 @@ The prompt never includes raw landmarks. It contains:
 
 - System prompt: role and guardrails (below). Placed first and marked with a cache breakpoint.
 - Exercise library in plain language: name, target, what good form looks like, for all five exercises. Placed inside the cached prefix.
-- Current session metrics: everything in `session_analysis` except `per_rep`, plus a condensed per-rep table (rep number, peak ROM, violations).
-- Last five sessions of the same exercise as a table of the same summary metrics.
+- Current session metrics: everything in `session_analysis` except `per_rep`, plus a condensed per-rep table (rep number, peak ROM, violations). When `low_quality` is true the payload says so explicitly and the prompt instructs Claude to caveat every observation with the tracking quality.
+- Last five sessions of the same exercise as a table of the same summary metrics, excluding low-quality sessions.
 - Current plan item (prescribed sets, reps, days per week).
 - The most recent clinical note, if any.
 
@@ -294,6 +318,8 @@ The progress summary (`kind = progress`) uses a smaller schema: `narrative: str`
 - Do not diagnose.
 - Reference only metrics and flags present in the payload. If a concern is outside the data, recommend `contact_patient` rather than inventing a clinical action.
 - Use plain clinical language. No hedging filler.
+- Describe `rom_trend_slope` as a within-session range of motion trend. Do not call it fatigue or attribute a cause.
+- Present every suggestion as a draft for the clinician to review, never as an instruction to the patient.
 
 ### Failure handling
 
@@ -350,6 +376,8 @@ Ownership rules: patients may only read their own sessions and plan. Doctors may
 
 - Python analyzer: the highest-value tests. Recorded landmark fixtures in `shared/fixtures/` per exercise (a clean set, a shallow set, a set with a form fault, a set with tracking dropout) with asserted rep counts, ROM ranges, and expected flags. Synthetic fixtures for zero reps, a single frame, and all-invisible landmarks.
 - TypeScript angle math and rep state machine: unit tests using the same fixtures. Both suites read the same files, so the two implementations are checked against the same truth.
+- Parity: each fixture ships with an `expected.json` (rep count, rep frame boundaries, per-rep peak ROM). Both suites assert against it. Rep boundaries must match within one frame and peak ROM within 0.5 degrees.
+- Quality gate: fixtures with dropout assert `valid_frame_ratio`, `low_quality`, and that reps spanning long gaps are discarded.
 - API: pytest against a Dockerized Postgres. Auth, ownership in both directions, upload-to-analysis path, plan replacement.
 - AI layer: prompt builder tested for payload shape and cache breakpoint placement without calling the API. One integration test hits the real API and validates the schema; skipped when no key is set.
 - Frontend: component tests for the session state machine with a mocked pose source. No browser end-to-end tests in v1.
@@ -359,14 +387,16 @@ Ownership rules: patients may only read their own sessions and plan. Doctors may
 Each phase ends in something demoable.
 
 1. Foundation: monorepo, Docker Compose, FastAPI with auth and models, Alembic, React shell with login and role routing, seed script with users only.
-2. Pose and rep counting: camera, MediaPipe, angle math, rep state machine, the squat end to end including upload and the Python analyzer with fixtures.
-3. Exercise library: remaining four exercises, form rules, fixtures and tests for each.
-4. Doctor dashboard: patient list, patient detail with charts, session review, plan editor, notes.
-5. AI summaries: prompt builder, structured output, background task, regenerate flow, progress summary, flag explanations.
-6. Polish and deploy: patient history, responsive pass, realistic seed history, deployment, README with screenshots and an architecture diagram.
+2. Landmark recorder: a bare, unstyled page that opens the camera, runs MediaPipe, and downloads the landmark timeseries as a fixture JSON. No rep counting, no UI polish. Used to record fixtures for every exercise (clean, shallow, form fault, dropout).
+3. Python analyzer: angle math, smoothing, quality gate, rep state machine, metrics, flags, all proven against the squat fixtures with `expected.json` values reviewed by hand. This is the core of the project and is finished and tested before any session UI exists.
+4. TypeScript analyzer: the same algorithm in the frontend, proven against the same fixtures with the parity test. Then the real session screen (calibration, overlay, live counting, cues, upload, IndexedDB retry) and the upload endpoint, giving the squat end to end.
+5. Exercise library: remaining four exercises, form rules, fixtures, expected values, and parity tests for each.
+6. Doctor dashboard: patient list, patient detail with charts, session review, plan editor, notes.
+7. AI summaries: prompt builder, structured output, background task, regenerate flow, progress summary, flag explanations.
+8. Polish and deploy: patient history, responsive pass, realistic seed history, deployment, README with screenshots and an architecture diagram.
 
 ## 11. Implementation notes
 
 - The orchestrating session runs on Opus 4.8 at high effort. Subagent tasks run on Sonnet 5 at medium effort.
 - Follow the `claude-api` skill's Python README when writing the summary service. Do not use recalled SDK patterns.
-- Keep files small and single-purpose. The analyzer in particular should be split into `angles.py`, `smoothing.py`, `reps.py`, `metrics.py`, and `flags.py`.
+- Keep files small and single-purpose. The analyzer in particular should be split into `angles.py`, `smoothing.py`, `quality.py`, `reps.py`, `metrics.py`, and `flags.py`. The TypeScript side mirrors this file split under `frontend/src/analysis/`.
